@@ -1,5 +1,6 @@
 # Mac OS
 .DS_Store
+*.app
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -102,3 +103,5 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+.vscode/
