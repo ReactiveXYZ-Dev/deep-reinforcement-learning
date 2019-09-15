@@ -9,16 +9,17 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-BUFFER_SIZE = int(1e5)  # replay buffer size
+BUFFER_SIZE = int(1e6)  # replay buffer size
 BATCH_SIZE = 128        # minibatch size
 GAMMA = 0.99            # discount factor
 TAU = 1e-3              # for soft update of target parameters
-LR_ACTOR = 1e-4         # learning rate of the actor
-LR_CRITIC = 1e-3        # learning rate of the critic
+LR_ACTOR = 1e-3         # learning rate of the actor
+LR_CRITIC = 2e-3        # learning rate of the critic
 WEIGHT_DECAY = 0        # L2 weight decay
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+NUM_AGENTS = 2
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 class Agent():
     """Interacts with and learns from the environment."""
@@ -46,18 +47,22 @@ class Agent():
 
         # Critic Network (w/ Target Network)
         self.critic_local = Critic(
-            state_size, action_size, random_seed).to(device)
+            state_size * NUM_AGENTS, action_size * NUM_AGENTS, random_seed).to(device)
         self.critic_target = Critic(
-            state_size, action_size, random_seed).to(device)
+            state_size * NUM_AGENTS, action_size * NUM_AGENTS, random_seed).to(device)
         self.critic_optimizer = optim.Adam(
             self.critic_local.parameters(), lr=LR_CRITIC, weight_decay=WEIGHT_DECAY)
 
         # Noise process
-        self.noise = OUNoise(action_size, random_seed)
+        self.noises = [OUNoise(action_size, random_seed) for _ in range(NUM_AGENTS)]
 
         # Replay memory
         self.memory = ReplayBuffer(
             action_size, BUFFER_SIZE, BATCH_SIZE, random_seed)
+
+        # Initialize the target networks fully
+        self.hard_update(self.actor_local, self.actor_target)
+        self.hard_update(self.critic_local, self.critic_target)
 
     def step(self, state, action, reward, next_state, done):
         """Save experience in replay memory, and use random sample from buffer to learn."""
@@ -74,14 +79,15 @@ class Agent():
         state = torch.from_numpy(state).float().to(device)
         self.actor_local.eval()
         with torch.no_grad():
-            action = self.actor_local(state).cpu().data.numpy()
+            action = self.actor_local(state).cpu().numpy()
         self.actor_local.train()
         if add_noise:
-            action += self.noise.sample()
+            action += [n.sample() for n in self.noises]
         return np.clip(action, -1, 1)
 
     def reset(self):
-        self.noise.reset()
+        for noise in self.noises:
+            noise.reset()
 
     def learn(self, experiences, gamma):
         """Update policy and value parameters using given batch of experience tuples.
@@ -95,34 +101,51 @@ class Agent():
             experiences (Tuple[torch.Tensor]): tuple of (s, a, r, s', done) tuples 
             gamma (float): discount factor
         """
+        # Sample a batch of transitions from the replay buffer
         states, actions, rewards, next_states, dones = experiences
 
-        # ---------------------------- update critic ---------------------------- #
-        # Get predicted next-state actions and Q values from target models
-        actions_next = self.actor_target(next_states)
-        Q_targets_next = self.critic_target(next_states, actions_next)
-        # Compute Q targets for current states (y_i)
-        Q_targets = rewards + (gamma * Q_targets_next * (1 - dones))
-        # Compute critic loss
-        Q_expected = self.critic_local(states, actions)
-        critic_loss = F.mse_loss(Q_expected, Q_targets)
-        # Minimize the loss
+        # Update online critic model
+        # Compute actions for next states with the target actor model
+        with torch.no_grad():
+            target_next_actions = [self.actor_target(
+                next_states[:, i, :]) for i in range(NUM_AGENTS)]
+
+        target_next_actions = torch.cat(target_next_actions, dim=1)
+
+        # Compute Q values for the next states and next actions with the target critic model
+        with torch.no_grad():
+            target_next_qs = self.critic_target(
+                next_states.flatten(), target_next_actions)
+
+        # Compute Q values for the current states and actions with the Bellman equation
+        target_qs = rewards.sum(1, keepdim=True) + GAMMA * target_next_qs * (1 - dones.max(1, keepdim=True)[0])
+
+        # Compute Q values for the current states and actions with the online critic model
+        actions = actions.view(actions.shape[0], -1)
+        online_qs = self.critic_local(states.flatten(), actions)
+
+        # Compute and minimize the online critic loss
+        critic_local_loss = F.mse_loss(online_qs, target_qs.detach())
         self.critic_optimizer.zero_grad()
-        critic_loss.backward()
+        critic_local_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic_local.parameters(), 1)
         self.critic_optimizer.step()
 
-        # ---------------------------- update actor ---------------------------- #
-        # Compute actor loss
-        actions_pred = self.actor_local(states)
-        actor_loss = -self.critic_local(states, actions_pred).mean()
-        # Minimize the loss
+        # Update online actor model
+        # Compute actions for the current states with the online actor model
+        online_actions = [self.actor_local(
+            states[:, i, :]) for i in range(NUM_AGENTS)]
+        online_actions = torch.cat(online_actions, dim=1)
+        # Compute the online actor loss with the online critic model
+        actor_local_loss = -self.critic_local(states.flatten(), online_actions).mean()
+        # Minimize the online critic loss
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        actor_local_loss.backward()
         self.actor_optimizer.step()
 
-        # ----------------------- update target networks ----------------------- #
-        self.soft_update(self.critic_local, self.critic_target, TAU)
-        self.soft_update(self.actor_local, self.actor_target, TAU)
+        # Update target critic and actor models
+        soft_update(self.actor_target, self.actor_local, TAU)
+        soft_update(self.critic_target, self.critic_local, TAU)
 
     def soft_update(self, local_model, target_model, tau):
         """Soft update model parameters.
@@ -138,11 +161,15 @@ class Agent():
             target_param.data.copy_(
                 tau*local_param.data + (1.0-tau)*target_param.data)
 
+    def hard_update(self, local_model, target_model):
+        for target_param, param in zip(target_model.parameters(), local_model.parameters()):
+            target_param.data.copy_(param.data)
+
 
 class OUNoise:
     """Ornstein-Uhlenbeck process."""
 
-    def __init__(self, size, seed, mu=0., theta=0.15, sigma=0.2):
+    def __init__(self, size, seed, mu=0., theta=0.15, sigma=0.1):
         """Initialize parameters and noise process."""
         self.mu = mu * np.ones(size)
         self.theta = theta
